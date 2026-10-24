@@ -48,8 +48,9 @@ def send_invitation_email(
 ) -> None:
     """Send an invitation to join a company on FixFlow."""
 
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
     invitation_url = (
-        "http://localhost:5173/accept-invitation"
+        f"{frontend_url}/accept-invitation"
         f"?token={invitation_token}"
     )
 

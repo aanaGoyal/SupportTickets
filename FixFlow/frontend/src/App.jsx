@@ -1,10 +1,9 @@
-
 import { useEffect, useState } from "react";
 import "./App.css";
 import Dashboard from "./Dashboard";
 
 const API_BASE =
-  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api/v1";
+  import.meta.env.VITE_API_BASE_URL || "/api/v1";
 
 function navigate(path) {
   window.history.pushState({}, "", path);
