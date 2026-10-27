@@ -318,6 +318,13 @@ function TicketDetails({
         </p>
       </div>
 
+      {ticket.status === "auto_answered" && ticket.reply && (
+        <div className="fx-ai-result">
+          <h4>Automatic customer reply</h4>
+          <div className="fx-ai-answer">{ticket.reply}</div>
+        </div>
+      )}
+
       <div className="fx-ai-panel">
         <div className="fx-panel-heading">
           <div>
@@ -729,6 +736,7 @@ export default function Dashboard({ onNavigate }) {
   const [notice, setNotice] = useState("");
   const [deletingId, setDeletingId] = useState(null);
   const [deletingCompanyId, setDeletingCompanyId] = useState(null);
+  const [deletingInvitationId, setDeletingInvitationId] = useState(null);
 
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiResult, setAiResult] = useState(null);
@@ -1017,6 +1025,47 @@ export default function Dashboard({ onNavigate }) {
     }
   }
 
+  async function handleDeleteInvitation(invitation) {
+    if (role !== "admin") {
+      setError("Only company admins can delete invitations.");
+      return;
+    }
+
+    const id = invitation?.id;
+
+    if (!id) {
+      setError("Cannot delete this invitation because its ID is missing.");
+      return;
+    }
+
+    const email = invitation.email || "this invitation";
+    const confirmed = window.confirm(
+      `Delete the invitation for ${email}? This action cannot be undone.`
+    );
+
+    if (!confirmed) return;
+
+    setDeletingInvitationId(id);
+    setError("");
+    setNotice("");
+
+    try {
+      const result = await apiRequest(
+        `/invitations/${encodeURIComponent(id)}`,
+        { method: "DELETE" }
+      );
+
+      setInvitations((current) =>
+        current.filter((item) => String(item.id) !== String(id))
+      );
+      setNotice(result.message || "Invitation deleted successfully.");
+    } catch (err) {
+      setError(err.message || "Unable to delete this invitation.");
+    } finally {
+      setDeletingInvitationId(null);
+    }
+  }
+
   async function handleGenerateAnswer(ticket) {
     if (!ticket) return;
 
@@ -1053,9 +1102,7 @@ export default function Dashboard({ onNavigate }) {
         citations: Array.isArray(result.citations) ? result.citations : [],
       });
     } catch (err) {
-      setAiError(
-        `${err.message} Check that the backend AI-answer endpoint accepts a JSON body containing "question".`
-      );
+      setAiError(err.message || "Unable to generate an AI response.");
     } finally {
       setAiLoading(false);
     }
@@ -1719,26 +1766,45 @@ export default function Dashboard({ onNavigate }) {
                         <th>Status</th>
                         <th>Sent</th>
                         <th>Expires</th>
+                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {invitations.map((invitation) => (
-                        <tr key={invitation.id}>
-                          <td>{invitation.full_name || "—"}</td>
-                          <td>{invitation.email}</td>
-                          <td>
-                            <span
-                              className={`fx-status fx-status-${statusClass(
-                                invitation.status
-                              )}`}
-                            >
-                              {invitation.status || "pending"}
-                            </span>
-                          </td>
-                          <td>{formatDate(invitation.created_at)}</td>
-                          <td>{formatDate(invitation.expires_at)}</td>
-                        </tr>
-                      ))}
+                      {invitations.map((invitation) => {
+                        const isDeleting =
+                          String(deletingInvitationId) ===
+                          String(invitation.id);
+
+                        return (
+                          <tr key={invitation.id}>
+                            <td>{invitation.full_name || "—"}</td>
+                            <td>{invitation.email}</td>
+                            <td>
+                              <span
+                                className={`fx-status fx-status-${statusClass(
+                                  invitation.status
+                                )}`}
+                              >
+                                {invitation.status || "pending"}
+                              </span>
+                            </td>
+                            <td>{formatDate(invitation.created_at)}</td>
+                            <td>{formatDate(invitation.expires_at)}</td>
+                            <td>
+                              <button
+                                type="button"
+                                className="fx-button fx-button-small fx-button-danger"
+                                disabled={isDeleting}
+                                onClick={() =>
+                                  handleDeleteInvitation(invitation)
+                                }
+                              >
+                                {isDeleting ? "Deleting…" : "Delete"}
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

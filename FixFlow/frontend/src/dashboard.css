@@ -666,7 +666,8 @@
 
 .fx-status-open,
 .fx-status-pending,
-.fx-status-new {
+.fx-status-new,
+.fx-status-pending-agent {
   background: var(--fx-warning-bg);
   color: var(--fx-warning);
 }
@@ -678,7 +679,8 @@
 
 .fx-status-resolved,
 .fx-status-closed,
-.fx-status-accepted {
+.fx-status-accepted,
+.fx-status-auto-answered {
   background: var(--fx-success-bg);
   color: var(--fx-success);
 }

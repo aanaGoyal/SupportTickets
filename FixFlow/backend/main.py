@@ -1,10 +1,10 @@
-
 import hashlib
 import logging
 import secrets
 import uuid
-import os 
+import os
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from sqlalchemy import delete
@@ -31,21 +31,25 @@ from models import (
     User,
     Tenant,
     Ticket,
+    Draft,
     Document,
     Invitation,
     UserRole,
-    OrganizationRegister,
+    TicketStatus,
     OrganizationAccessRequest,
 )
 from schemas import (
     TokenResponse,
     TenantOut,
     TicketCreate,
+    TicketIntakeOut,
     TicketOut,
     TicketUpdate,
     InvitationCreate,
     InvitationAccept,
+    AIAnswerRequest,
     AIAnswerOut,
+    OrganizationRegister,
 )
 from security import (
     create_access_token,
@@ -61,8 +65,9 @@ from rag_service import (
     answer_question,
     index_document,
     delete_document_vectors,
+    reply_requires_internal_action,
+    warmup_embedding_model,
 )
-
 
 # ==================================================
 # APPLICATION
@@ -70,6 +75,7 @@ from rag_service import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fixflow")
+
 # Aurora Bank server-to-server integration
 AURORA_INTEGRATION_KEY = os.getenv("AURORA_INTEGRATION_KEY")
 AURORA_TENANT_ID = os.getenv("AURORA_TENANT_ID")
@@ -108,10 +114,23 @@ def verify_aurora_integration(
             detail="Aurora tenant configuration is invalid",
         )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load the embedding model once at startup, not on the first ticket."""
+    try:
+        warmup_embedding_model()
+        logger.info("Embedding model is ready")
+    except Exception:
+        logger.exception("Embedding model warm-up failed")
+    yield
+
+
 app = FastAPI(
     title="FixFlow API",
     version="1.0.0",
     description="Multi-tenant AI customer support platform",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -729,9 +748,8 @@ def get_platform_metrics(
     ).all()
 
     tickets_by_status = {
-        "open": 0,
-        "in_progress": 0,
-        "resolved": 0,
+        ticket_status.value: 0
+        for ticket_status in TicketStatus
     }
 
     for ticket_status, count in status_counts:
@@ -744,6 +762,9 @@ def get_platform_metrics(
         "open_tickets": tickets_by_status["open"],
         "in_progress_tickets": tickets_by_status["in_progress"],
         "resolved_tickets": tickets_by_status["resolved"],
+        "new_tickets": tickets_by_status["new"],
+        "pending_agent_tickets": tickets_by_status["pending_agent"],
+        "auto_answered_tickets": tickets_by_status["auto_answered"],
         "tickets_by_status": tickets_by_status,
     }
 
@@ -777,9 +798,10 @@ def create_ticket(
 
     return ticket
 
+
 @app.post(
     "/api/v1/integrations/aurora/tickets",
-    response_model=TicketOut,
+    response_model=TicketIntakeOut,
     status_code=status.HTTP_201_CREATED,
 )
 def create_aurora_ticket(
@@ -787,6 +809,7 @@ def create_aurora_ticket(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID = Depends(verify_aurora_integration),
 ):
+    """Save an integration ticket and auto-reply only when customer-safe."""
     # Confirm the configured Aurora Bank tenant exists.
     tenant = db.get(Tenant, tenant_id)
 
@@ -796,18 +819,105 @@ def create_aurora_ticket(
             detail="Configured Aurora Bank tenant does not exist",
         )
 
-    # Create the ticket under Aurora Bank's tenant.
+    # 1. Always save the ticket first, so the company sees every ticket.
     ticket = Ticket(
         subject=ticket_data.subject,
         body=ticket_data.body,
         tenant_id=tenant_id,
+        status=TicketStatus.new,
     )
 
     db.add(ticket)
     db.commit()
     db.refresh(ticket)
 
-    return ticket    
+    ticket_text = (
+        f"Ticket subject: {ticket.subject}\n\n"
+        f"Customer issue:\n{ticket.body}"
+    )
+
+    try:
+        # 2. Search only this company's documents and draft an answer.
+        result = answer_question(
+            tenant_id=tenant_id,
+            query=ticket_text,
+            retrieval_query=f"{ticket.subject}\n{ticket.body}",
+            company_name=tenant.name,
+            verify_evidence=True,
+        )
+
+        reply = str(result.get("answer") or "").strip()
+        retrieved_sources = result.get("citations")
+        has_retrieved_sources = (
+            isinstance(retrieved_sources, list)
+            and bool(retrieved_sources)
+            and all(
+                isinstance(source, dict)
+                and isinstance(source.get("source"), str)
+                and bool(source["source"].strip())
+                and source["source"].strip().lower() != "unknown source"
+                and bool(source.get("document_id"))
+                and bool(source.get("chunk_key"))
+                for source in retrieved_sources
+            )
+        )
+
+        # 3. Collect every reason the ticket needs a human.
+        reasons = []
+
+        if result.get("insufficient_evidence"):
+            reasons.append("insufficient_evidence")
+
+        if result.get("evidence_check_failed"):
+            reasons.append("answer_not_supported_by_evidence")
+
+        if not reply:
+            reasons.append("empty_reply")
+
+        if not has_retrieved_sources:
+            reasons.append("missing_or_invalid_sources")
+
+        # Only run the safety check when everything else already passed.
+        if not reasons and reply_requires_internal_action(
+            ticket_text,
+            reply,
+        ):
+            reasons.append("reply_safety_check")
+
+        # 4. Decide: answer the customer, or hand over to an agent.
+        if reasons:
+            logger.info(
+                "Ticket %s routed to an agent: %s; citation_count=%s",
+                ticket.id,
+                ",".join(reasons),
+                (
+                    len(retrieved_sources)
+                    if isinstance(retrieved_sources, list)
+                    else 0
+                ),
+            )
+            ticket.reply = None
+            ticket.status = TicketStatus.pending_agent
+        else:
+            logger.info(
+                "Ticket %s received an automatic answer; citation_count=%s",
+                ticket.id,
+                len(retrieved_sources),
+            )
+            ticket.reply = reply
+            ticket.status = TicketStatus.auto_answered
+
+    except Exception:
+        logger.exception(
+            "Automatic customer-safe response generation failed for ticket %s",
+            ticket.id,
+        )
+        ticket.reply = None
+        ticket.status = TicketStatus.pending_agent
+
+    db.commit()
+    db.refresh(ticket)
+    return ticket
 
 
 @app.get(
@@ -924,21 +1034,33 @@ def delete_ticket(
 )
 def generate_ticket_ai_answer(
     ticket_id: uuid.UUID,
+    request: AIAnswerRequest | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     tenant_id = require_tenant_user(current_user)
     ticket = get_ticket_or_404(db, tenant_id, ticket_id)
 
-    question = (
+    tenant = db.get(Tenant, tenant_id)
+    company_name = tenant.name if tenant else "the company"
+
+    ticket_context = (
         f"Ticket subject: {ticket.subject}\n\n"
         f"Customer issue:\n{ticket.body}"
+    )
+    agent_question = (request.question or "").strip() if request else ""
+    question = (
+        f"{ticket_context}\n\nAgent question:\n{agent_question}"
+        if agent_question
+        else ticket_context
     )
 
     try:
         result = answer_question(
             tenant_id=tenant_id,
             query=question,
+            retrieval_query=agent_question or ticket_context,
+            company_name=company_name,
         )
 
         return AIAnswerOut(**result)
@@ -1322,6 +1444,38 @@ def list_invitations(
     return results
 
 
+@app.delete("/api/v1/invitations/{invitation_id}")
+def delete_invitation(
+    invitation_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    if current_user.role != UserRole.admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only company administrators can delete invitations",
+        )
+
+    tenant_id = require_tenant_user(current_user)
+    invitation = db.scalar(
+        select(Invitation).where(
+            Invitation.id == invitation_id,
+            Invitation.tenant_id == tenant_id,
+        )
+    )
+
+    if invitation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invitation not found",
+        )
+
+    db.delete(invitation)
+    db.commit()
+
+    return {"message": "Invitation deleted successfully"}
+
+
 @app.post("/api/v1/invitations/accept")
 def accept_invitation(
     invitation_data: InvitationAccept,
@@ -1398,6 +1552,11 @@ def accept_invitation(
         logger.exception("Invitation acceptance failed")
         raise
 
+
+# ==================================================
+# DELETE A COMPANY (PLATFORM ADMIN)
+# ==================================================
+
 @app.delete("/api/v1/tenants/{tenant_id}")
 def delete_company(
     tenant_id: uuid.UUID,
@@ -1412,12 +1571,28 @@ def delete_company(
             detail="Company not found.",
         )
 
+    # Collect this company's documents so their search vectors can be removed.
+    document_ids = db.scalars(
+        select(Document.id).where(Document.tenant_id == tenant_id)
+    ).all()
+
+    for document_id in document_ids:
+        try:
+            delete_document_vectors(
+                tenant_id=tenant_id,
+                document_id=document_id,
+            )
+        except Exception:
+            logger.exception(
+                "Could not remove search vectors for document %s",
+                document_id,
+            )
+
     try:
         # Delete dependent records before deleting the company.
-        # Adjust model names/foreign-key fields if yours differ.
         db.execute(
             delete(Draft).where(Draft.tenant_id == tenant_id)
-        ) if "Draft" in globals() else None
+        )
 
         db.execute(
             delete(Invitation).where(Invitation.tenant_id == tenant_id)
@@ -1445,6 +1620,7 @@ def delete_company(
 
     except Exception:
         db.rollback()
+        logger.exception("Company deletion failed")
         raise HTTPException(
             status_code=500,
             detail="Unable to delete company. Check dependent records and database constraints.",

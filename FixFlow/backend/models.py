@@ -28,6 +28,9 @@ class UserRole(str, enum.Enum):
 
 
 class TicketStatus(str, enum.Enum):
+    new = "new"
+    pending_agent = "pending_agent"
+    auto_answered = "auto_answered"
     open = "open"
     in_progress = "in_progress"
     resolved = "resolved"
@@ -109,6 +112,7 @@ class Ticket(Base):
         default=TicketStatus.open,
         server_default="open",
     )
+    reply: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     category: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     priority: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     assigned_to_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -172,6 +176,8 @@ class Document(Base):
     tenant: Mapped["Tenant"] = relationship(
         back_populates="documents",
     )
+
+    
 class Draft(Base):
     __tablename__ = "drafts"
 

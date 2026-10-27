@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict, Field, EmailStr, field_validator
 from sqlalchemy import select, func
 
 from models import TicketStatus
-from pydantic import BaseModel, Field
 
 def validate_password_rules(password: str) -> str:
     if not 12 <= len(password) <= 128:
@@ -49,10 +48,15 @@ class TicketOut(BaseModel):
     subject: str
     body: str
     status: TicketStatus
+    reply: Optional[str] = None
     category: Optional[str] = None
     priority: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+
+class TicketIntakeOut(TicketOut):
+    pass
 
 
 class TenantOut(BaseModel):
@@ -65,7 +69,7 @@ class TenantOut(BaseModel):
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
+    password: str = Field(min_length=12, max_length=128)
     tenant_id: uuid.UUID
     role: str = "agent"
 
@@ -118,3 +122,7 @@ class AIAnswerOut(BaseModel):
     answer: str
     insufficient_evidence: bool
     citations: list[dict] = Field(default_factory=list)
+
+
+class AIAnswerRequest(BaseModel):
+    question: Optional[str] = Field(default=None, max_length=2000)
